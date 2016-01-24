@@ -20,8 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
-	"github.com/hashicorp/golang-lru"
+	"planb/vendor/github.com/hashicorp/golang-lru"
 )
 
 var (
@@ -60,8 +59,8 @@ type Router struct {
 	FlushInterval  time.Duration
 	rp             *httputil.ReverseProxy
 	dialer         *net.Dialer
-	readRedisPool  *redis.Pool
-	writeRedisPool *redis.Pool
+	readRedisPool  *redis.Client
+	writeRedisPool *redis.Client
 	logger         *Logger
 	ctxMutex       sync.Mutex
 	reqCtx         map[*http.Request]*requestData
@@ -91,16 +90,12 @@ func (router *Router) Init() error {
 	if router.LogPath == "" {
 		router.LogPath = "./access.log"
 	}
-	router.readRedisPool = &redis.Pool{
-		MaxIdle:     100,
-		IdleTimeout: 1 * time.Minute,
-		Dial:        redisDialer(router.ReadRedisHost, router.ReadRedisPort),
-	}
-	router.writeRedisPool = &redis.Pool{
-		MaxIdle:     100,
-		IdleTimeout: 1 * time.Minute,
-		Dial:        redisDialer(router.WriteRedisHost, router.WriteRedisPort),
-	}
+
+	rr := fmt.Sprintf("%s:%s", router.ReadRedisRouter, router.ReadRedisPort)
+	rw := fmt.Sprintf("%s:%s", router.WriteRedisRouter, router.WriteRedisPort)
+	router.readRedisPool = redis.New(rr)
+	router.writeRedisPool = redis.New(rw)
+
 	if router.logger == nil {
 		router.logger, err = NewFileLogger(router.LogPath)
 		if err != nil {
