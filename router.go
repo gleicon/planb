@@ -48,25 +48,26 @@ func (r *requestData) String() string {
 
 type Router struct {
 	http.Transport
-	ReadRedisHost  string
-	ReadRedisPort  int
-	WriteRedisHost string
-	WriteRedisPort int
-	LogPath        string
-	DialTimeout    time.Duration
-	RequestTimeout time.Duration
-	DeadBackendTTL int
-	FlushInterval  time.Duration
-	rp             *httputil.ReverseProxy
-	dialer         *net.Dialer
-	readRedisPool  *redis.Client
-	writeRedisPool *redis.Client
-	logger         *Logger
-	ctxMutex       sync.Mutex
-	reqCtx         map[*http.Request]*requestData
-	rrMutex        sync.RWMutex
-	roundRobin     map[string]*uint64
-	cache          *lru.Cache
+	ReadRedisHost   string
+	ReadRedisPort   int
+	WriteRedisHost  string
+	WriteRedisPort  int
+	LogPath         string
+	DialTimeout     time.Duration
+	RequestTimeout  time.Duration
+	DeadBackendTTL  int
+	FlushInterval   time.Duration
+	rp              *httputil.ReverseProxy
+	dialer          *net.Dialer
+	readRedisPool   *redis.Client
+	writeRedisPool  *redis.Client
+	logger          *Logger
+	ctxMutex        sync.Mutex
+	reqCtx          map[*http.Request]*requestData
+	rrMutex         sync.RWMutex
+	roundRobin      map[string]*uint64
+	cache           *lru.Cache
+	appDomainsCache *lru.Cache // domains we are configured to serve (avoids hammering redis with non-existing apps)
 }
 
 func redisDialer(host string, port int) func() (redis.Conn, error) {
@@ -111,6 +112,44 @@ func (router *Router) Init() error {
 			return err
 		}
 	}
+
+	if router.appDomainsCache == nil {
+		router.appDomainsCache, err = lru.New(1024) // we can serve up to 1024 apps
+		if err != nil {
+			return err
+		}
+	}
+
+	go func() {
+		// this is a watchdog coroutine that scans redis for a list of frontend:<domains>
+		// and builds a cache to be queried near the point the http requests gets in.
+		// this way we can 404 the request w/o spending much processing or roundtrip to redis.
+		// the vanilla planb will hog both redis and its process in case you fall for some bot
+		// thinking it has a proxy signature.
+		for {
+			for {
+				cursor, keys, err := rc.Scan(c, "match", "TESTSCAN*")
+				if err != nil {
+					logError("Error Scanning redis for frontend", err)
+					time.Sleep(1000 * time.Millisecond)
+					continue
+				}
+
+				for _, k := range keys {
+					router.appDomainsCache.Add(k)
+				}
+
+				if cursor == "0" {
+					break
+				}
+
+				c = cursor // update cursor
+			}
+			logInfo("Frontend watchdog: %d frontends", router.appDomainsCache.Len())
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+
 	router.reqCtx = make(map[*http.Request]*requestData)
 	router.dialer = &net.Dialer{
 		Timeout:   router.DialTimeout,
@@ -153,33 +192,31 @@ func (router *Router) getBackends(host string) (*backendSet, error) {
 		}
 	}
 	var set backendSet
-	conn := router.readRedisPool.Get()
-	defer conn.Close()
-	conn.Send("MULTI")
-	conn.Send("LRANGE", "frontend:"+host, 0, -1)
-	conn.Send("SMEMBERS", "dead:"+host)
-	data, err := conn.Do("EXEC")
+
+	backends, err := router.readRedisPool.LRange("frontend:"+host, 0, -1)
 	if err != nil {
-		return nil, fmt.Errorf("error running redis commands: %s", err)
+		return nil, fmt.Errorf("Redis error fetching frontend %s list : %s %s", host, err)
 	}
-	responses := data.([]interface{})
-	if len(responses) != 2 {
-		return nil, fmt.Errorf("unexpected redis response: %#v", responses)
+
+	deadMembers, err := router.readRedisPool.SMembers("dead:" + host)
+	if err != nil {
+		return nil, fmt.Errorf("Redis error fetching dead frontend %s set : %s %s", host, err)
 	}
-	backends := responses[0].([]interface{})
+
 	if len(backends) < 2 {
 		return nil, errors.New("no backends available")
 	}
-	set.id = string(backends[0].([]byte))
+
+	set.id = backends[0]
 	backends = backends[1:]
 	set.backends = make([]string, len(backends))
 	for i, backend := range backends {
-		set.backends[i] = string(backend.([]byte))
+		set.backends[i] = backend
 	}
-	deadMembers := responses[1].([]interface{})
+
 	deadMap := map[uint64]struct{}{}
 	for _, dead := range deadMembers {
-		deadIdx, _ := strconv.ParseUint(string(dead.([]byte)), 10, 64)
+		deadIdx, _ := strconv.ParseUint(dead, 10, 64)
 		deadMap[deadIdx] = struct{}{}
 	}
 	set.dead = deadMap
@@ -190,6 +227,12 @@ func (router *Router) getBackends(host string) (*backendSet, error) {
 
 func (router *Router) getRequestData(req *http.Request, save bool) (*requestData, error) {
 	host, _, _ := net.SplitHostPort(req.Host)
+
+	// check if we answer for this app (host)
+	if !router.appDomainsCache.Contains(host) {
+		return nil, fmt.Errorf("No application %s configured", host)
+	}
+
 	if host == "" {
 		host = req.Host
 	}
@@ -258,6 +301,7 @@ func (router *Router) Director(req *http.Request) {
 		logError(reqData.String(), req.URL.Path, fmt.Errorf("invalid backend url: %s", err))
 		return
 	}
+
 	req.URL.Scheme = url.Scheme
 	req.URL.Host = url.Host
 }
@@ -309,17 +353,23 @@ func (router *Router) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			logError(reqData.String(), req.URL.Path, err)
 			if markAsDead {
-				conn := router.writeRedisPool.Get()
-				defer conn.Close()
-				conn.Send("MULTI")
-				conn.Send("SADD", "dead:"+reqData.host, reqData.backendIdx)
-				conn.Send("EXPIRE", "dead:"+reqData.host, router.DeadBackendTTL)
-				conn.Send("PUBLISH", "dead", fmt.Sprintf("%s;%s;%d;%d", reqData.host, reqData.backend, reqData.backendIdx, reqData.backendLen))
-				_, redisErr := conn.Do("EXEC")
+				err := router.writeRedisPool.SAdd("dead:"+reqData.host, reqData.backendIdx)
 				if redisErr != nil {
-					logError(reqData.String(), req.URL.Path, fmt.Errorf("error markind dead backend in redis: %s", redisErr))
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis SADD: error marking dead backend: %s", redisErr))
 				}
+
+				err := router.writeRedisPool.Expire("dead:"+reqData.host, router.DeadBackendTTL)
+				if redisErr != nil {
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis EXPIRE: error marking dead backend: %s", redisErr))
+				}
+
+				err := router.writeRedisPool.Publish("dead", fmt.Sprintf("%s;%s;%d;%d", reqData.host, reqData.backend, reqData.backendIdx, reqData.backendLen))
+				if redisErr != nil {
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis PUBLISH: error markind dead backend: %s", redisErr))
+				}
+
 			}
+
 			rsp = &http.Response{
 				Request:    req,
 				StatusCode: http.StatusServiceUnavailable,
