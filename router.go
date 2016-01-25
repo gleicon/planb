@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -21,7 +22,7 @@ import (
 	"time"
 
 	"github.com/fiorix/go-redis/redis"
-	"planb/vendor/github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/golang-lru"
 )
 
 var (
@@ -71,14 +72,51 @@ type Router struct {
 	appDomainsCache *lru.Cache // domains we are configured to serve (avoids hammering redis with non-existing apps)
 }
 
+func (router *Router) updateAppCache() {
+	var c string
+	for {
+		cursor, keys, err := router.readRedisPool.Scan(c, "match", "frontend:*")
+		if err != nil {
+			logError("Error Scanning redis for frontend", "", err)
+			time.Sleep(1000 * time.Millisecond)
+			continue
+		}
+
+		for _, k := range keys {
+			kapp := strings.Split(k, ":")
+			router.appDomainsCache.Add(kapp[1], true)
+		}
+
+		if cursor == "0" {
+			break
+		}
+
+		c = cursor // update cursor
+	}
+	s := fmt.Sprintf("Frontend watchdog: %d frontends", router.appDomainsCache.Len())
+	log.Println(router.appDomainsCache.Keys())
+	logInfo(s)
+}
+
 func (router *Router) Init() error {
 	var err error
 	if router.LogPath == "" {
 		router.LogPath = "./access.log"
 	}
 
-	rr := fmt.Sprintf("%s:%s", router.ReadRedisRouter, router.ReadRedisPort)
-	rw := fmt.Sprintf("%s:%s", router.WriteRedisRouter, router.WriteRedisPort)
+	if router.ReadRedisHost == "" {
+		router.ReadRedisHost = "127.0.0.1"
+		router.ReadRedisPort = 6379
+	}
+
+	if router.WriteRedisHost == "" {
+		router.WriteRedisHost = "127.0.0.1"
+		router.WriteRedisPort = 6379
+	}
+
+	rr := fmt.Sprintf("%s:%d", router.ReadRedisHost, router.ReadRedisPort)
+	rw := fmt.Sprintf("%s:%d", router.WriteRedisHost, router.WriteRedisPort)
+
 	router.readRedisPool = redis.New(rr)
 	router.writeRedisPool = redis.New(rw)
 
@@ -103,6 +141,7 @@ func (router *Router) Init() error {
 		if err != nil {
 			return err
 		}
+		router.updateAppCache()
 	}
 
 	go func() {
@@ -112,25 +151,7 @@ func (router *Router) Init() error {
 		// the vanilla planb will hog both redis and its process in case you fall for some bot
 		// thinking it has a proxy signature.
 		for {
-			for {
-				cursor, keys, err := rc.Scan(c, "match", "frontend:*")
-				if err != nil {
-					logError("Error Scanning redis for frontend", err)
-					time.Sleep(1000 * time.Millisecond)
-					continue
-				}
-
-				for _, k := range keys {
-					router.appDomainsCache.Add(k)
-				}
-
-				if cursor == "0" {
-					break
-				}
-
-				c = cursor // update cursor
-			}
-			logInfo("Frontend watchdog: %d frontends", router.appDomainsCache.Len())
+			router.updateAppCache()
 			time.Sleep(500 * time.Millisecond)
 		}
 	}()
@@ -213,11 +234,6 @@ func (router *Router) getBackends(host string) (*backendSet, error) {
 func (router *Router) getRequestData(req *http.Request, save bool) (*requestData, error) {
 	host, _, _ := net.SplitHostPort(req.Host)
 
-	// check if we answer for this app (host)
-	if !router.appDomainsCache.Contains(host) {
-		return nil, fmt.Errorf("No application %s configured", host)
-	}
-
 	if host == "" {
 		host = req.Host
 	}
@@ -277,10 +293,6 @@ func (router *Router) getRequestData(req *http.Request, save bool) (*requestData
 
 func (router *Router) Director(req *http.Request) {
 	reqData, err := router.getRequestData(req, true)
-	if err != nil {
-		logError(reqData.String(), req.URL.Path, err)
-		return
-	}
 	url, err := url.Parse(reqData.backend)
 	if err != nil {
 		logError(reqData.String(), req.URL.Path, fmt.Errorf("invalid backend url: %s", err))
@@ -294,6 +306,11 @@ func (router *Router) Director(req *http.Request) {
 func (router *Router) RoundTrip(req *http.Request) (*http.Response, error) {
 	router.ctxMutex.Lock()
 	reqData := router.reqCtx[req]
+	// context has nil request data
+	if reqData == nil {
+		return nil, fmt.Errorf("No request Data ")
+	}
+
 	delete(router.reqCtx, req)
 	router.ctxMutex.Unlock()
 	var rsp *http.Response
@@ -338,19 +355,19 @@ func (router *Router) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			logError(reqData.String(), req.URL.Path, err)
 			if markAsDead {
-				err := router.writeRedisPool.SAdd("dead:"+reqData.host, reqData.backendIdx)
-				if redisErr != nil {
-					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis SADD: error marking dead backend: %s", redisErr))
+				_, err := router.writeRedisPool.SAdd("dead:"+reqData.host, reqData.backendIdx)
+				if err != nil {
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis SADD: error marking dead backend: %s", err))
 				}
 
-				err := router.writeRedisPool.Expire("dead:"+reqData.host, router.DeadBackendTTL)
-				if redisErr != nil {
-					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis EXPIRE: error marking dead backend: %s", redisErr))
+				_, err = router.writeRedisPool.Expire("dead:"+reqData.host, router.DeadBackendTTL)
+				if err != nil {
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis EXPIRE: error marking dead backend: %s", err))
 				}
 
-				err := router.writeRedisPool.Publish("dead", fmt.Sprintf("%s;%s;%d;%d", reqData.host, reqData.backend, reqData.backendIdx, reqData.backendLen))
-				if redisErr != nil {
-					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis PUBLISH: error markind dead backend: %s", redisErr))
+				err = router.writeRedisPool.Publish("dead", fmt.Sprintf("%s;%s;%d;%d", reqData.host, reqData.backend, reqData.backendIdx, reqData.backendLen))
+				if err != nil {
+					logError(reqData.String(), req.URL.Path, fmt.Errorf("Redis PUBLISH: error markind dead backend: %s", err))
 				}
 
 			}
@@ -432,10 +449,22 @@ func (router *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.Write([]byte("OK"))
 		return
 	}
+
+	// check if we answer for this app (host)
+	if !router.appDomainsCache.Contains(req.Host) {
+		http.Error(rw, "", http.StatusNotFound)
+		return
+	}
+
 	upgrade := req.Header.Get("Upgrade")
 	if upgrade != "" && strings.ToLower(upgrade) == "websocket" {
 		reqData, err := router.serveWebsocket(rw, req)
 		if err != nil {
+			if reqData == nil {
+				logError("Error getting request data", req.URL.Path, err)
+				http.Error(rw, "", http.StatusNotFound)
+				return
+			}
 			logError(reqData.String(), req.URL.Path, err)
 			http.Error(rw, "", http.StatusBadGateway)
 		}

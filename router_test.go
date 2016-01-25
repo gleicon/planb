@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"planb/vendor/gopkg.in/check.v1"
+	"gopkg.in/check.v1"
 
 	"github.com/fiorix/go-redis/redis"
 	"golang.org/x/net/websocket"
@@ -35,9 +35,9 @@ func Test(t *testing.T) {
 
 func (s *S) SetUpTest(c *check.C) {
 	var err error
-	s.redis, err = redis.New("127.0.0.1:6379")
+	s.redis = redis.New("127.0.0.1:6379")
 	c.Assert(err, check.IsNil)
-	keys, err := redis.Values(s.redis.Do("KEYS", "frontend:*"))
+	keys, err := s.redis.Keys("frontend:*")
 	c.Assert(err, check.IsNil)
 	for _, k := range keys {
 		_, err = s.redis.Del(k)
