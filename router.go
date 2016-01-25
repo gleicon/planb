@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fiorix/go-redis/redis"
 	"planb/vendor/github.com/hashicorp/golang-lru"
 )
 
@@ -68,22 +69,6 @@ type Router struct {
 	roundRobin      map[string]*uint64
 	cache           *lru.Cache
 	appDomainsCache *lru.Cache // domains we are configured to serve (avoids hammering redis with non-existing apps)
-}
-
-func redisDialer(host string, port int) func() (redis.Conn, error) {
-	readTimeout := time.Second
-	writeTimeout := time.Second
-	dialTimeout := time.Second
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	if port == 0 {
-		port = 6379
-	}
-	redisAddr := fmt.Sprintf("%s:%d", host, port)
-	return func() (redis.Conn, error) {
-		return redis.DialTimeout("tcp", redisAddr, dialTimeout, readTimeout, writeTimeout)
-	}
 }
 
 func (router *Router) Init() error {

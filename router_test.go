@@ -17,13 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"planb/vendor/gopkg.in/check.v1"
+
+	"github.com/fiorix/go-redis/redis"
 	"golang.org/x/net/websocket"
-	"gopkg.in/check.v1"
 )
 
 type S struct {
-	redis redis.Conn
+	redis *redis.Client
 }
 
 var _ = check.Suite(&S{})
@@ -34,12 +35,12 @@ func Test(t *testing.T) {
 
 func (s *S) SetUpTest(c *check.C) {
 	var err error
-	s.redis, err = redis.Dial("tcp", "127.0.0.1:6379")
+	s.redis, err = redis.New("127.0.0.1:6379")
 	c.Assert(err, check.IsNil)
 	keys, err := redis.Values(s.redis.Do("KEYS", "frontend:*"))
 	c.Assert(err, check.IsNil)
 	for _, k := range keys {
-		_, err = s.redis.Do("DEL", k)
+		_, err = s.redis.Del(k)
 		c.Assert(err, check.IsNil)
 	}
 }
@@ -177,9 +178,9 @@ func (s *S) TestServeHTTPRoundRobin(c *check.C) {
 		servers = append(servers, srv)
 	}
 	var err error
-	_, err = s.redis.Do("RPUSH", "frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
+	_, err = s.redis.RPush("frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
 	c.Assert(err, check.IsNil)
-	_, err = s.redis.Do("RPUSH", "frontend:otherfrontend.com", "otherfrontend", servers[2].URL, servers[3].URL)
+	_, err = s.redis.RPush("frontend:otherfrontend.com", "otherfrontend", servers[2].URL, servers[3].URL)
 	c.Assert(err, check.IsNil)
 	router := Router{}
 	err = router.Init()
@@ -220,7 +221,7 @@ func (s *S) TestServeHTTPCache(c *check.C) {
 		defer srv.Close()
 		servers = append(servers, srv)
 	}
-	_, err := s.redis.Do("RPUSH", "frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
+	_, err := s.redis.RPush("frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
 	c.Assert(err, check.IsNil)
 	router := Router{}
 	err = router.Init()
@@ -273,7 +274,7 @@ func (s *S) TestServeHTTPWebSocket(c *check.C) {
 		servers = append(servers, srv)
 	}
 	var err error
-	_, err = s.redis.Do("RPUSH", "frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
+	_, err = s.redis.RPush("frontend:myfrontend.com", "myfrontend", servers[0].URL, servers[1].URL)
 	c.Assert(err, check.IsNil)
 	router := Router{}
 	err = router.Init()
