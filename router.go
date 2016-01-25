@@ -128,7 +128,7 @@ func (router *Router) Init() error {
 		// thinking it has a proxy signature.
 		for {
 			for {
-				cursor, keys, err := rc.Scan(c, "match", "TESTSCAN*")
+				cursor, keys, err := rc.Scan(c, "match", "frontend:*")
 				if err != nil {
 					logError("Error Scanning redis for frontend", err)
 					time.Sleep(1000 * time.Millisecond)
